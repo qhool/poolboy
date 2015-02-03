@@ -208,11 +208,17 @@ handle_call(_Msg, _From, State) ->
     Reply = {error, invalid_message},
     {reply, Reply, State}.
 
-handle_info({'DOWN', Ref, _, _, _}, State) ->
+handle_info({'DOWN', Ref, _, _, Reason}, State) ->
+    #state{supervisor = Sup} = State,
     case ets:match(State#state.monitors, {'$1', Ref}) of
         [[Pid]] ->
             true = ets:delete(State#state.monitors, Pid),
-            NewState = handle_checkin(Pid, State),
+            NewState = case Reason of
+                           normal -> handle_checkin(Pid, State);
+                           _ ->
+                               ok = dismiss_worker(Sup,Pid),
+                               handle_worker_exit(Pid,State)
+                       end,
             {noreply, NewState};
         [] ->
             Waiting = queue:filter(fun ({_, R}) -> R =/= Ref end, State#state.waiting),
