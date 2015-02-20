@@ -5,7 +5,7 @@
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
          transaction/3, child_spec/2, child_spec/3, start/1, start/2,
-         start_link/1, start_link/2, stop/1, status/1]).
+         start_link/1, start_link/2, stop/1, status/1, qstatus/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
@@ -120,6 +120,10 @@ stop(Pool) ->
 status(Pool) ->
     gen_server:call(Pool, status).
 
+-spec qstatus(Pool :: pool()) -> {atom(), integer(), integer(), integer()}.
+qstatus(Pool) ->
+    gen_server:call(Pool, qstatus).
+
 init({PoolArgs, WorkerArgs}) ->
     process_flag(trap_exit, true),
     Waiting = queue:new(),
@@ -192,6 +196,13 @@ handle_call(status, _From, State) ->
            overflow = Overflow} = State,
     StateName = state_name(State),
     {reply, {StateName, length(Workers), Overflow, ets:info(Monitors, size)}, State};
+handle_call(qstatus, _From, State) ->
+    #state{workers = Workers,
+           monitors = Monitors,
+           overflow = Overflow,
+           waiting = Waiting} = State,
+    StateName = state_name(State),
+    {reply, {StateName, length(Workers), Overflow, ets:info(Monitors, size), queue:len(Waiting)}, State};
 handle_call(get_avail_workers, _From, State) ->
     Workers = State#state.workers,
     {reply, Workers, State};
