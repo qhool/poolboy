@@ -29,6 +29,10 @@
 
 -record(state, {
     supervisor :: pid(),
+    worker_module :: atom(),
+    on_checkin  = false :: boolean(),
+    on_checkout = false :: boolean(),
+    on_exit     = false :: boolean(),
     workers :: [pid()],
     waiting :: pid_queue(),
     monitors :: ets:tid(),
@@ -128,11 +132,20 @@ init({PoolArgs, WorkerArgs}) ->
     process_flag(trap_exit, true),
     Waiting = queue:new(),
     Monitors = ets:new(monitors, [private]),
-    init(PoolArgs, WorkerArgs, #state{waiting = Waiting, monitors = Monitors}).
+    init(PoolArgs, WorkerArgs, #state{waiting = Waiting, 
+                                      monitors = Monitors}).
 
 init([{worker_module, Mod} | Rest], WorkerArgs, State) when is_atom(Mod) ->
     {ok, Sup} = poolboy_sup:start_link(Mod, WorkerArgs),
-    init(Rest, WorkerArgs, State#state{supervisor = Sup});
+    ModFunctions = Mod:module_info(functions),
+    OnCheckout = (proplists:get_value(on_checkout, ModFunctions, -1) =:= 1),
+    OnCheckin = (proplists:get_value(on_checkin, ModFunctions, -1) =:= 1),
+    OnExit = (proplists:get_value(on_exit, ModFunctions, -1) =:= 2),
+    init(Rest, WorkerArgs, State#state{supervisor = Sup, 
+                                       worker_module = Mod,
+                                       on_checkin = OnCheckin,
+                                       on_checkout = OnCheckout,
+                                       on_exit = OnExit});
 init([{size, Size} | Rest], WorkerArgs, State) when is_integer(Size) ->
     init(Rest, WorkerArgs, State#state{size = Size});
 init([{max_overflow, MaxOverflow} | Rest], WorkerArgs, State) when is_integer(MaxOverflow) ->
@@ -177,10 +190,12 @@ handle_call({checkout, Block}, {FromPid, _} = From, State) ->
         [Pid | Left] ->
             Ref = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
+            ok = on_checkout(Pid, State),
             {reply, Pid, State#state{workers = Left}};
         [] when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, Ref} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
+            ok = on_checkout(Pid, State),
             {reply, Pid, State#state{overflow = Overflow + 1}};
         [] when Block =:= false ->
             {reply, full, State};
@@ -228,21 +243,21 @@ handle_info({'DOWN', Ref, _, _, Reason}, State) ->
                            normal -> handle_checkin(Pid, State);
                            _ ->
                                ok = dismiss_worker(Sup,Pid),
-                               handle_worker_exit(Pid,State)
+                               handle_worker_exit(Pid,State,Reason)
                        end,
             {noreply, NewState};
         [] ->
             Waiting = queue:filter(fun ({_, R}) -> R =/= Ref end, State#state.waiting),
             {noreply, State#state{waiting = Waiting}}
     end;
-handle_info({'EXIT', Pid, _Reason}, State) ->
+handle_info({'EXIT', Pid, Reason}, State) ->
     #state{supervisor = Sup,
            monitors = Monitors} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, Ref}] ->
             true = erlang:demonitor(Ref),
             true = ets:delete(Monitors, Pid),
-            NewState = handle_worker_exit(Pid, State),
+            NewState = handle_worker_exit(Pid, State, Reason),
             {noreply, NewState};
         [] ->
             case lists:member(Pid, State#state.workers) of
@@ -303,9 +318,11 @@ handle_checkin(Pid, State) ->
            monitors = Monitors,
            overflow = Overflow,
            strategy = Strategy} = State,
+    ok = on_checkin(Pid, State),
     case queue:out(Waiting) of
         {{value, {From, Ref}}, Left} ->
             true = ets:insert(Monitors, {Pid, Ref}),
+            ok = on_checkout(Pid, State),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
         {empty, Empty} when Overflow > 0 ->
@@ -319,14 +336,16 @@ handle_checkin(Pid, State) ->
             State#state{workers = Workers, waiting = Empty, overflow = 0}
     end.
 
-handle_worker_exit(Pid, State) ->
+handle_worker_exit(Pid, State, Reason) ->
     #state{supervisor = Sup,
            monitors = Monitors,
            overflow = Overflow} = State,
+    ok = on_exit(Pid, State, Reason),
     case queue:out(State#state.waiting) of
         {{value, {From, Ref}}, LeftWaiting} ->
             NewWorker = new_worker(State#state.supervisor),
             true = ets:insert(Monitors, {NewWorker, Ref}),
+            ok = on_checkout(NewWorker, State),
             gen_server:reply(From, NewWorker),
             State#state{waiting = LeftWaiting};
         {empty, Empty} when Overflow > 0 ->
@@ -349,3 +368,12 @@ state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
     full;
 state_name(_State) ->
     overflow.
+
+on_checkin(Pid, #state{worker_module = Mod, on_checkin = true}) -> Mod:on_checkin(Pid);
+on_checkin(_Pid, #state{on_checkin = false}) -> ok.
+
+on_checkout(Pid, #state{worker_module = Mod, on_checkout = true}) -> Mod:on_checkout(Pid);
+on_checkout(_Pid, #state{on_checkout = false}) -> ok.
+
+on_exit(Pid, #state{worker_module = Mod, on_exit = true}, Reason) -> Mod:on_exit(Pid, Reason);
+on_exit(_Pid, #state{on_exit = false}, _Reason) -> ok.
